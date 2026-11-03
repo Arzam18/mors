@@ -1,0 +1,117 @@
+name: Build MORS for Android ARM64
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "src/**"
+      - "vendor/fathom/**"
+      - "networks/**"
+      - ".github/workflows/android.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  android-arm64:
+    name: Android ARM64 (NEON + Dotprod)
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Locate Android NDK
+        id: ndk
+        shell: bash
+        run: |
+          set -euo pipefail
+          NDK="${ANDROID_NDK_LATEST_HOME:-${ANDROID_NDK_HOME:-}}"
+          if [[ -z "$NDK" ]]; then
+            NDK="$(find "${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}/ndk" \
+              -mindepth 1 -maxdepth 1 -type d 2>/dev/null | sort -V | tail -n 1)"
+          fi
+          test -n "$NDK" && test -d "$NDK"
+          TOOLCHAIN="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          test -x "$TOOLCHAIN/aarch64-linux-android24-clang++"
+          echo "ndk=$NDK" >> "$GITHUB_OUTPUT"
+          echo "toolchain=$TOOLCHAIN" >> "$GITHUB_OUTPUT"
+          echo "Using NDK: $NDK"
+
+      - name: Download and verify default NNUE
+        shell: bash
+        run: |
+          set -euo pipefail
+          NETWORK="networks/mors-p2h32-s14400M-o3183M-c+frc.mnue"
+          EXPECTED_SHA="F9A996768AE627666718C9F88F4E604D1CA0723D03CFC63E134E18DD082E0D57"
+          EXPECTED_BYTES="27527336"
+          mkdir -p networks
+          if [[ ! -f "$NETWORK" ]]; then
+            URL="https://github.com/TMagnusN/mors/raw/refs/heads/main/$NETWORK"
+            curl --fail --location --retry 3 --retry-all-errors "$URL" -o "$NETWORK"
+          fi
+          ACTUAL_SHA="$(sha256sum "$NETWORK" | awk '{print toupper($1)}')"
+          ACTUAL_BYTES="$(wc -c < "$NETWORK" | tr -d ' ')"
+          [[ "$ACTUAL_SHA" == "$EXPECTED_SHA" ]] || {
+            echo "NNUE SHA-256 mismatch: $ACTUAL_SHA" >&2; exit 1;
+          }
+          [[ "$ACTUAL_BYTES" == "$EXPECTED_BYTES" ]] || {
+            echo "NNUE size mismatch: $ACTUAL_BYTES" >&2; exit 1;
+          }
+          echo "Verified default NNUE: $ACTUAL_BYTES bytes"
+
+      - name: Check ARMv8.2-A Dotprod support
+        shell: bash
+        env:
+          TOOLCHAIN: ${{ steps.ndk.outputs.toolchain }}
+        run: |
+          set -euo pipefail
+          printf '#if !defined(__aarch64__) || !defined(__ARM_FEATURE_DOTPROD)\n#error Missing AArch64 Dotprod target support\n#endif\nint main() { return 0; }\n' > /tmp/feature.cpp
+          "$TOOLCHAIN/aarch64-linux-android24-clang++" \
+            -march=armv8.2-a+dotprod -fsyntax-only /tmp/feature.cpp
+          "$TOOLCHAIN/aarch64-linux-android24-clang++" \
+            -march=armv8.2-a+dotprod -dM -E -x c++ /dev/null \
+            | grep -E '__ARM_FEATURE_DOTPROD|__aarch64__'
+
+      - name: Build MORS
+        shell: bash
+        env:
+          TOOLCHAIN: ${{ steps.ndk.outputs.toolchain }}
+        run: |
+          set -euo pipefail
+          export PATH="$TOOLCHAIN:$PATH"
+          CXX="$TOOLCHAIN/aarch64-linux-android24-clang++"
+          ARCH_FLAGS="-march=armv8.2-a+dotprod -mtune=cortex-a76 -fPIE"
+          LINK_FLAGS="-Wl,--gc-sections -pie"
+          make -C src -j2 engine \
+            CONFIG=release ARCH=generic LTO=0 PGO=0 EXE_EXT= \
+            CXX="$CXX" ARCH_FLAGS="$ARCH_FLAGS" \
+            LINK_FLAGS="$LINK_FLAGS" LDFLAGS="$LINK_FLAGS" \
+            WINDOWS_RESOURCE_OBJECT= WINDRES=true
+          mkdir -p dist
+          cp build/release-generic/Dragon-of-MORS-generic \
+            dist/mors-android-arm64-dotprod
+
+      - name: Verify Android executable
+        shell: bash
+        env:
+          TOOLCHAIN: ${{ steps.ndk.outputs.toolchain }}
+        run: |
+          set -euo pipefail
+          BIN="dist/mors-android-arm64-dotprod"
+          test -s "$BIN"
+          "$TOOLCHAIN/llvm-readelf" -hW "$BIN" | tee /tmp/elf-header.txt
+          grep -q 'Machine:.*AArch64' /tmp/elf-header.txt
+          if "$TOOLCHAIN/llvm-readelf" -dW "$BIN" | grep -q 'libc++_shared.so'; then
+            echo "Unexpected libc++_shared.so dependency" >&2
+            exit 1
+          fi
+          file "$BIN"
+          sha256sum "$BIN"
+
+      - name: Upload Android ARM64 engine
+        uses: actions/upload-artifact@v4
+        with:
+          name: MORS-Android-ARM64-Dotprod
+          path: dist/mors-android-arm64-dotprod
+          if-no-files-found: error
+          retention-days: 30

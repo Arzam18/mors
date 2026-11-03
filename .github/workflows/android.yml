@@ -81,7 +81,8 @@ jobs:
           export PATH="$TOOLCHAIN:$PATH"
           CXX="$TOOLCHAIN/aarch64-linux-android24-clang++"
           ARCH_FLAGS="-march=armv8.2-a+dotprod -mtune=cortex-a76 -fPIE"
-          LINK_FLAGS="-Wl,--gc-sections -pie"
+          # Android clang++ defaults to libc++_shared.so; select the NDK static libc++ runtime.
+          LINK_FLAGS="-Wl,--gc-sections -pie -static-libstdc++"
           make -C src -j2 engine \
             CONFIG=release ARCH=generic LTO=0 PGO=0 EXE_EXT= \
             CXX="$CXX" ARCH_FLAGS="$ARCH_FLAGS" \
@@ -101,10 +102,13 @@ jobs:
           test -s "$BIN"
           "$TOOLCHAIN/llvm-readelf" -hW "$BIN" | tee /tmp/elf-header.txt
           grep -q 'Machine:.*AArch64' /tmp/elf-header.txt
-          if "$TOOLCHAIN/llvm-readelf" -dW "$BIN" | grep -q 'libc++_shared.so'; then
-            echo "Unexpected libc++_shared.so dependency" >&2
+          DYNAMIC_INFO="$("$TOOLCHAIN/llvm-readelf" -dW "$BIN")"
+          printf '%s\n' "$DYNAMIC_INFO"
+          if grep -q 'libc++_shared\.so' <<<"$DYNAMIC_INFO"; then
+            echo "Unexpected libc++_shared.so dependency; static libc++ link did not take effect" >&2
             exit 1
           fi
+          echo "Verified: no libc++_shared.so dependency"
           file "$BIN"
           sha256sum "$BIN"
 
